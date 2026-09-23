@@ -1,0 +1,6 @@
+# build/test artifacts
+.scratch/
+.DS_Store
+
+__pycache__/
+*.pyc
