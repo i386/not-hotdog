@@ -94,6 +94,118 @@ func run(baseURL: String, expectation: String, label: String) async {
         } catch {
             fail("\(label): wrong error type: \(type(of: error)) \(error)")
         }
+    case "discover":
+        // GET /v1/models on a mesh node: the System One capability must be how the
+        // client finds candidates (mesh-llm #2093), not a hardcoded id.
+        do {
+            let all = try await client.models()
+            guard all.count == 3 else {
+                fail("\(label): expected 3 advertised models, got \(all.map(\.id))")
+            }
+            let systemOne = try await client.systemOneModels().map(\.id)
+            guard systemOne == ["diffusiongemma-26B-A4B-it-Q4_K_M"] else {
+                fail("\(label): system-one models \(systemOne) != [diffusiongemma-26B-A4B-it-Q4_K_M]")
+            }
+            let vision = try await client.visionModels().map(\.id)
+            guard vision == ["qwen3-vl-8b-instruct"] else {
+                fail("\(label): vision models \(vision) != [qwen3-vl-8b-instruct]")
+            }
+            guard !systemOne.contains("qwen3-dense-0.6b"),
+                  !vision.contains("qwen3-dense-0.6b") else {
+                fail("\(label): a text-only model leaked into a capability filter")
+            }
+            guard let card = all.first(where: { $0.id == systemOne[0] }) else {
+                fail("\(label): system-one model missing from the full list")
+            }
+            guard card.supportsSystemOne, !card.supportsVision else {
+                fail("\(label): capability flags disagree for \(card.id)")
+            }
+            print("PASS \(label): system_one=[\(systemOne[0])] vision=[\(vision[0])] of \(all.count) models")
+        } catch {
+            fail("\(label): discovery threw: \(error)")
+        }
+    case "discover-absent":
+        // Upstream OpenJEV has no /v1/models: a 404 must read as "nothing
+        // advertised", not as a failed classification.
+        do {
+            let all = try await client.models()
+            guard all.isEmpty else { fail("\(label): expected no advertised models, got \(all.map(\.id))") }
+            let verdict = try await client.classify(jpegData: jpeg)
+            guard verdict.route == .direct else { fail("\(label): route \(verdict.route) != direct") }
+            print("PASS \(label): no /v1/models, direct read still works (p=\(verdict.probability))")
+        } catch {
+            fail("\(label): discovery-absent threw: \(error)")
+        }
+    case "laya-read":
+        // A decision-only node: discover the loaded model, then run a text-only read
+        // under the discovered id (the stub rejects ids it does not serve).
+        do {
+            let cards = try await client.systemOneModels()
+            guard cards.count == 1, let card = cards.first else {
+                fail("\(label): expected one System One model, got \(cards.map(\.id))")
+            }
+            let pinned = try OpenJEVClient(
+                baseURL: baseURL, apiKey: nil, mode: .direct,
+                systemOneModel: card.id, visionModel: "vision-family-stub", timeout: 10
+            )
+            let response = try await pinned.systemOne(state: "A hot dog with mustard.", images: [])
+            let probability = try response.noul(forKey: OpenJEVClient.questionKey)
+            guard abs(probability - 0.93) < 1e-9 else {
+                fail("\(label): probability \(probability) != 0.93")
+            }
+            guard response.model == card.id else {
+                fail("\(label): served model \(response.model ?? "nil") != discovered \(card.id)")
+            }
+            guard Verdict.verdict(probability: probability) else {
+                fail("\(label): 0.93 must classify HOTDOG")
+            }
+            print("PASS \(label): discovered \(card.id) -> p=0.93 HOTDOG")
+        } catch {
+            fail("\(label): laya-read threw: \(error)")
+        }
+    case "laya-caption":
+        // Mesh mode needs a caption model; a Laya-only node refuses chat completions.
+        // The failure must name that, not surface a bare 501.
+        do {
+            let meshOnly = try OpenJEVClient(
+                baseURL: baseURL, apiKey: nil, mode: .mesh,
+                systemOneModel: "openjev-latest", visionModel: "mesh-llm-laya-322m", timeout: 10
+            )
+            _ = try await meshOnly.classify(jpegData: jpeg)
+            fail("\(label): expected the caption leg to be refused")
+        } catch let error as ClassifyError {
+            guard error.isVisionUnavailable else {
+                fail("\(label): wrong error kind: \(error) (\(error.isImagesUnsupported ? "imagesUnsupported" : "-"))")
+            }
+            guard error.localizedDescription.contains("/systemone") else {
+                fail("\(label): message lost the culprit route: \(error.localizedDescription)")
+            }
+            print("PASS \(label): visionUnavailable surfaced: \(error.localizedDescription)")
+        } catch {
+            fail("\(label): wrong error type: \(type(of: error)) \(error)")
+        }
+    case "laya-auto":
+        // The whole chain on a Laya-only node: direct -> 501 images -> caption -> refused.
+        do {
+            let direct = try OpenJEVClient(
+                baseURL: baseURL, apiKey: nil, mode: .direct,
+                systemOneModel: "openjev-latest", visionModel: "vision-family-stub", timeout: 10
+            )
+            do {
+                _ = try await direct.classify(jpegData: jpeg)
+                fail("\(label): direct mode should report images unsupported")
+            } catch let error as ClassifyError where error.isImagesUnsupported {
+                // expected: the decision backend is text-only, images are not involved
+            }
+            do {
+                _ = try await client.classify(jpegData: jpeg)
+                fail("\(label): auto mode should end in a caption refusal")
+            } catch let error as ClassifyError where error.isVisionUnavailable {
+                print("PASS \(label): direct=imagesUnsupported, auto=\(error.localizedDescription)")
+            }
+        } catch {
+            fail("\(label): laya-auto threw: \(error)")
+        }
     default:
         fail("unknown expectation \(expectation)")
     }
@@ -105,7 +217,9 @@ func run(baseURL: String, expectation: String, label: String) async {
 }
 
 let args = CommandLine.arguments
-guard args.count >= 3 else { fail("usage: smoke_test <base-url> <direct|mesh|mesh-salad|error-images> [label]") }
+guard args.count >= 3 else {
+    fail("usage: smoke_test <base-url> <direct|mesh|mesh-salad|error-images|discover|discover-absent|laya-read|laya-caption|laya-auto> [label]")
+}
 let label = args.count > 3 ? args[3] : args[2]
 
 let semaphore = DispatchSemaphore(value: 0)

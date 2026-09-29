@@ -33,6 +33,28 @@ deployment story for both upstream OpenJEV and the mesh-llm port.
 So **Auto mode** (default) tries direct first and falls back to caption-then-read when
 the endpoint is a mesh-llm PoC. Both routes are also selectable manually.
 
+### More than one System One model
+
+mesh-llm main now serves System One from more than one backend, chosen from the
+loaded model's GGUF architecture
+(`crates/mesh-llm-host-runtime/src/runtime/local.rs`):
+
+| backend | family | notes |
+|---|---|---|
+| `openjev` | DiffusionGemma | the 26B-A4B diffusion read; complete model on one lane |
+| `laya` | Laya | decision-only native runtime (322M), no KV cache, CPU by default; serves `POST /systemone` and refuses every other OpenAI surface |
+
+`GET /v1/models` advertises the capability per model — `capabilities` contains
+`"system_one"` and `system_one_status` is `supported`/`likely`/`none`, claimed
+only when the loaded runtime can actually execute the endpoint (mesh-llm #2093).
+That is what **Discover models** reads.
+
+A Laya-only node has no caption model: mesh mode will report
+*"Vision caption unavailable: this Laya decision model only serves POST
+/systemone"* rather than a bare 501 — point the vision model at a real vision
+family, or use direct mode against upstream OpenJEV. Both were once one
+hand-typed model id; the app no longer assumes that.
+
 ## Quick start
 
 1. Open `SeeFood/SeeFood.xcodeproj` in **Xcode 16+** (project uses synchronized groups,
@@ -43,6 +65,11 @@ the endpoint is a mesh-llm PoC. Both routes are also selectable manually.
    key, pick mode. Defaults to `http://127.0.0.1:8080` (upstream OpenJEV's MLX default
    port; loopback HTTP is ATS-exempt — the Info.plist allows arbitrary loads so
    tailnet/LAN IPs work too).
+4. On a mesh-llm endpoint, tap **Discover models**: the app reads `GET /v1/models`
+   and lists the models that advertise the `system_one` capability, so whichever
+   System One backend the node has loaded (DiffusionGemma, Laya, or both) becomes a
+   picker selection instead of a hand-typed id. Upstream OpenJEV has no
+   `/v1/models` — enter its model id by hand, as before.
 
 ## Backends
 
@@ -63,9 +90,10 @@ Needs one deployment serving:
    16.8 GB, system-one capability tag) on a single Skippy worker for `/systemone`
    (the PoC refuses split/downstream deployments).
 
-Set **System One model** accordingly (mesh-llm accepts `openjev-latest` as an alias)
-and **Vision model** to the served vision family id. The app follows the PoC's
-`/systemone` route automatically.
+Tap **Discover models** and the app fills both: **System One model** from the
+models advertising `system_one` (a Laya node advertises its own id; mesh-llm also
+accepts `openjev-latest` as an alias) and **Vision model** from the models
+advertising `vision`. The app follows the PoC's `/systemone` route automatically.
 
 Known gap (candidate mesh-llm issue): System One image support in the native op, and
 aligning the route to `/v1/systemone`. Until then the mesh path classifies from a
@@ -74,11 +102,13 @@ vision caption — see the trade-off note in
 
 ### Contract stub (no model needed)
 
-`backend/stub_server.py` emulates both personalities and **validates request shapes**
-(data-URL images, `noul` question shape, `image_url` chat parts, route presence):
+`backend/stub_server.py` emulates three personalities — `upstream`, `mesh`
+(DiffusionGemma), `laya` (decision-only) — and **validates request shapes**
+(data-URL images, `noul` question shape, `image_url` chat parts, route presence,
+`/v1/models` cards, and that the requested model id is one the deployment serves):
 
 ```bash
-backend/run_smoke.sh          # builds the client with swiftc, runs 4 scenarios
+backend/run_smoke.sh          # builds the client with swiftc, runs 9 scenarios
 ```
 
 ## Wire contract
@@ -91,25 +121,43 @@ backend/run_smoke.sh          # builds the client with swiftc, runs 4 scenarios
 | Answer envelope | `{model, answers, usage}` | identical |
 | noul answer | `answers.hotdog.noul = P(yes)` | `{type:"noul", noul}` (type tag tolerated by the client) |
 | Errors | 400/422 FastAPI-ish | `{"error":{message,type,code}}` (`errors.rs`) |
-| Chat | OpenAI-style, model `diffusiongemma-26b` | OpenAI-style, `image_url` parts handled (`hooks.rs`) |
+| Chat | OpenAI-style, model `diffusiongemma-26b` | OpenAI-style, `image_url` parts handled (`hooks.rs`); a decision-only model (Laya) refuses it with 501 |
+| Model list | absent (`/v1/models` → 404) | `GET /v1/models`, `capabilities` + `system_one_status` per model (#2093) |
 
 The client decodes both answer styles and both error envelopes, and treats
 `404` as "try the other route" and `images`-mentioning unsupported errors as "fall
 back to mesh mode".
 
-## Verification status (2026-09-24)
+## Verification status (2026-09-29)
 
-- `backend/run_smoke.sh`: **all 4 scenarios green** on this machine
+- `backend/run_smoke.sh`: **all 9 scenarios green** on this machine
   (Apple Swift 6.4, arm64, macOS 27) against the contract stubs:
   1. auto vs upstream → direct image read, `p=0.97` → HOTDOG
   2. auto vs mesh PoC → `/v1/systemone` 404 → `/systemone` 501 images → caption →
      `/systemone` 200 `p=0.93` → HOTDOG (full fallback chain in the request log)
   3. mesh salad caption → `p=0.02` → NOT HOTDOG
   4. direct pinned vs mesh PoC → clean `imagesUnsupported` surfacing
-- `project.pbxproj` and `Info.plist`: `plutil -lint` OK.
+  5. `/v1/models` discovery → exactly one System One model, one vision model, and
+     the text-only third entry excluded from both filters
+  6. endpoint without `/v1/models` (upstream) → empty list, classification unaffected
+  7. decision-only node (Laya) → the discovered id drives a text-only read on
+     `/systemone`, `p=0.93`
+  8. decision-only node → the caption leg is refused by name (`visionUnavailable`,
+     message names `POST /systemone`)
+  9. auto chain on that node → `imagesUnsupported` from direct, caption refusal from
+     the fallback
+- The discovery scenario is **falsified, not just green**: with the stub's
+  `system_one` capability removed, scenario 5 fails
+  (`system-one models [] != [diffusiongemma-26B-A4B-it-Q4_K_M]`), so it is testing
+  the capability claim rather than a hardcoded list.
+- The mesh/laya stubs reject model ids they do not serve (plus mesh-llm's alias
+  list), so a client that ignores discovery fails the run.
+- `project.pbxproj` and `Info.plist`: `plutil -lint` OK; every Swift source
+  `swiftc -parse` clean.
 - **Not compiled:** the SwiftUI layer (`SeeFoodApp`, `ContentView`, `Camera`,
-  `SettingsView`) — the build machine has no Xcode, only CommandLineTools. Expect
-  first-compile nits there; the wire layer it calls is the tested part.
+  `SettingsView`) — the build machine has no Xcode and no iOS SDK, only
+  CommandLineTools, so the UI can only be syntax-checked here. Expect first-compile
+  nits there; the wire layer it calls is the tested part.
 
 ## Repo layout
 

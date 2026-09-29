@@ -8,17 +8,27 @@ response tolerance:
   upstream  — upstream OpenJEV (razorback16/openjev README):
               POST /v1/systemone accepts `images`; /systemone is absent (404);
               POST /v1/chat/completions serves captions.
-  mesh      — mesh-llm origin/main openai-frontend:
+  mesh      — mesh-llm origin/main openai-frontend with a diffusion backend:
               POST /systemone (only); non-empty `images` -> 501 unsupported_model_feature
               "this PoC supports one text-only System One read; images, ...";
-              /v1/systemone -> 404; /v1/chat/completions accepts image_url parts.
+              /v1/systemone -> 404; /v1/chat/completions accepts image_url parts;
+              GET /v1/models advertises `capabilities: ["text", "system_one"]`.
+  laya      — mesh-llm origin/main with a decision-only backend (Laya, #2083):
+              identical routes, but /v1/chat/completions is refused with
+              "this Laya decision model only serves POST /systemone" and the
+              /v1/models card names the Laya model.
 
 Env:
-  SEEFOOD_STUB_PROFILE  upstream | mesh   (default upstream)
-  SEEFOOD_STUB_PORT     port to bind      (default 8081)
+  SEEFOOD_STUB_PROFILE  upstream | mesh | laya   (default upstream)
+  SEEFOOD_STUB_PORT     port to bind             (default 8081)
 
-Deterministic answers: hotdog noul = 0.97 (upstream), 0.93 (mesh);
+Deterministic answers: hotdog noul = 0.97 (upstream), 0.93 (mesh/laya);
 state containing "salad" -> 0.02 so negative cases are exercisable.
+
+The mesh and laya profiles also validate the requested model against the ids
+they advertise plus mesh-llm's own alias list (skippy-server system_one.rs
+ALIASES), so a client that ignores discovery fails here instead of silently
+passing.
 """
 
 import base64
@@ -37,6 +47,43 @@ UNSUPPORTED_MSG = (
     "this PoC supports one text-only System One read; images, multiple "
     "steps/samples, thinking, and sequential reads are not yet supported"
 )
+
+# mesh-llm crates/skippy-server/src/frontend/system_one.rs accepts these aliases
+# for whatever System One model is loaded.
+ALIASES = ["openjev-latest", "openjev-0.1", "jev-latest", "jev-preview"]
+
+# What each profile advertises on GET /v1/models, mirroring the card shape from
+# crates/mesh-llm-host-runtime/src/network/openai/response/models.rs (#2093):
+# `capabilities` carries "system_one" only when the loaded runtime can execute
+# POST /systemone, and `system_one_status` is supported | likely | none.
+VISION_MODEL = "qwen3-vl-8b-instruct"
+PROFILE_MODELS = {
+    "mesh": [
+        {"id": "diffusiongemma-26B-A4B-it-Q4_K_M", "display_name": "DiffusionGemma 26B A4B (System One)",
+         "capabilities": ["text", "system_one"], "system_one_status": "supported",
+         "vision_status": "none"},
+        {"id": VISION_MODEL, "display_name": "Qwen3-VL 8B",
+         "capabilities": ["text", "multimodal", "vision"], "system_one_status": "none",
+         "vision_status": "supported"},
+        {"id": "qwen3-dense-0.6b", "display_name": "Qwen3 0.6B",
+         "capabilities": ["text"], "system_one_status": "none", "vision_status": "none"},
+    ],
+    "laya": [
+        {"id": "mesh-llm-laya-322m", "display_name": "Laya 322M (decision)",
+         "capabilities": ["text", "system_one"], "system_one_status": "supported",
+         "vision_status": "none"},
+        {"id": VISION_MODEL, "display_name": "Qwen3-VL 8B",
+         "capabilities": ["text", "multimodal", "vision"], "system_one_status": "none",
+         "vision_status": "supported"},
+    ],
+}
+
+LAYAH_ONLY_RESPONSE = "this Laya decision model only serves POST /systemone"
+
+
+def accepted_models() -> set[str]:
+    """Ids this profile answers on, plus mesh-llm's System One aliases."""
+    return {m["id"] for m in PROFILE_MODELS.get(PROFILE, [])} | set(ALIASES)
 
 
 def oai_error(status: int, message: str, code: str) -> bytes:
@@ -86,6 +133,11 @@ class Handler(BaseHTTPRequestHandler):
     # -- contract checks -------------------------------------------------
     def _validate_systemone_common(self, body: dict) -> None:
         assert isinstance(body.get("model"), str) and body["model"], "model must be a non-empty string"
+        if PROFILE in PROFILE_MODELS:
+            # Same rule as skippy-server: the loaded id or one of the aliases.
+            assert body["model"] in accepted_models(), (
+                f"model {body['model']!r} is not loaded; use one of "
+                f"{sorted(accepted_models())}")
         assert isinstance(body.get("state"), str), "state must be a string"
         q = body.get("questions")
         assert isinstance(q, dict) and q, "questions must be a non-empty object"
@@ -137,6 +189,11 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._systemone(allows_images=False)
             elif self.path == "/v1/chat/completions":
+                if PROFILE == "laya":
+                    # mesh-llm #2083: a decision-only backend refuses every other
+                    # OpenAI surface without looking at the body.
+                    self._send(501, oai_error(501, LAYAH_ONLY_RESPONSE, "unsupported_model_feature"))
+                    return
                 body = self._body()
                 self._validate_caption_request(body)
                 caption = ("A grilled hot dog with mustard in a plain bun."
@@ -171,7 +228,11 @@ class Handler(BaseHTTPRequestHandler):
             self._validate_images(body)
         state = body.get("state", "")
         probability = 0.02 if "salad" in state.lower() else (0.97 if PROFILE == "upstream" else 0.93)
-        model = "openjev-latest" if PROFILE == "upstream" else "diffusiongemma-26B-A4B-it-Q4_K_M"
+        if PROFILE == "upstream":
+            model = "openjev-latest"
+        else:
+            # The loaded model answers under its own id, whatever alias was used.
+            model = next(m["id"] for m in PROFILE_MODELS[PROFILE] if "system_one" in m["capabilities"])
         self._send_json(200, {
             "model": model,
             "answers": {"hotdog": {"type": "noul", "noul": probability}},
@@ -179,6 +240,14 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def do_GET(self):
+        if self.path == "/v1/models" and PROFILE in PROFILE_MODELS:
+            self._send_json(200, {
+                "object": "list",
+                "data": [{**card, "object": "model", "owned_by": "mesh-llm"}
+                         for card in PROFILE_MODELS[PROFILE]],
+            })
+            return
+        # Upstream OpenJEV has no /v1/models; a client must tolerate the 404.
         self._send(404, oai_error(404, f"route not found: {self.path}", "not_found"))
 
 

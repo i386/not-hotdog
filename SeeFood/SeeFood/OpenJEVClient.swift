@@ -31,6 +31,9 @@ public enum ClassifyError: LocalizedError, Equatable {
     case http(status: Int, message: String)
     /// The endpoint answered that `images` are not supported (mesh-llm PoC today).
     case imagesUnsupported(message: String)
+    /// The configured caption model refuses chat completions — a decision-only
+    /// backend such as Laya serves `POST /systemone` and nothing else.
+    case visionUnavailable(message: String)
     case badResponse(String)
     case network(String)
 
@@ -39,12 +42,14 @@ public enum ClassifyError: LocalizedError, Equatable {
         case let .badURL(text): return "Bad endpoint URL: \(text)"
         case let .http(status, message): return "HTTP \(status): \(message)"
         case let .imagesUnsupported(message): return message
+        case let .visionUnavailable(message): return "Vision caption unavailable: \(message)"
         case let .badResponse(message): return "Unexpected response: \(message)"
         case let .network(message): return "Network error: \(message)"
         }
     }
 
     var isImagesUnsupported: Bool { if case .imagesUnsupported = self { return true }; return false }
+    var isVisionUnavailable: Bool { if case .visionUnavailable = self { return true }; return false }
 }
 
 // MARK: - Client
@@ -238,7 +243,17 @@ public final class OpenJEVClient {
 
         let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200 ..< 300).contains(status) else { throw ClassifyError.http(status: status, message: Self.errorMessage(from: data, status: status)) }
+        guard (200 ..< 300).contains(status) else {
+            let message = Self.errorMessage(from: data, status: status)
+            // A decision-only backend (Laya, mesh-llm #2083) answers exactly
+            // "this Laya decision model only serves POST /systemone" to every
+            // other OpenAI surface. Say which setting is wrong instead of
+            // surfacing a bare 501.
+            if message.contains("only serves POST /systemone") {
+                throw ClassifyError.visionUnavailable(message: message)
+            }
+            throw ClassifyError.http(status: status, message: message)
+        }
         do {
             let decoded = try JSONDecoder().decode(ChatCompletionResponseDTO.self, from: data)
             guard let content = decoded.content, !content.isEmpty else {
@@ -253,6 +268,39 @@ public final class OpenJEVClient {
     }
 
     public static let captionPrompt = "Describe the food in this photo in one short sentence. Name the food."
+
+    // MARK: GET /v1/models — which models on this deployment serve System One
+
+    /// Every model the endpoint advertises, or [] when it advertises none
+    /// (upstream OpenJEV has no /v1/models; a 404 is not an error here).
+    public func models() async throws -> [ModelCardDTO] {
+        var request = URLRequest(url: try endpointURL(path: "/v1/models"))
+        request.httpMethod = "GET"
+        if let apiKey { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 404 { return [] }
+        guard (200 ..< 300).contains(status) else {
+            throw ClassifyError.http(status: status, message: Self.errorMessage(from: data, status: status))
+        }
+        do {
+            return try JSONDecoder().decode(ModelListDTO.self, from: data).data ?? []
+        } catch {
+            throw ClassifyError.badResponse("undecodable /v1/models body: \(error)")
+        }
+    }
+
+    /// The models that can run a System One read on this deployment. Large on a
+    /// mesh node serving more than one: e.g. DiffusionGemma and Laya together.
+    public func systemOneModels() async throws -> [ModelCardDTO] {
+        try await models().filter { $0.supportsSystemOne }
+    }
+
+    /// The models that accept `image_url` chat parts — what the caption leg needs.
+    public func visionModels() async throws -> [ModelCardDTO] {
+        try await models().filter { $0.supportsVision }
+    }
 
     // MARK: Helpers
 
