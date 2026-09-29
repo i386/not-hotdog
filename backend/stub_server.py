@@ -82,8 +82,23 @@ LAYAH_ONLY_RESPONSE = "this Laya decision model only serves POST /systemone"
 
 
 def accepted_models() -> set[str]:
-    """Ids this profile answers on, plus mesh-llm's System One aliases."""
-    return {m["id"] for m in PROFILE_MODELS.get(PROFILE, [])} | set(ALIASES)
+    """Ids this profile answers /systemone for, plus mesh-llm's System One aliases.
+
+    Restricted to the cards that advertise the capability: a model the server
+    lists as text-only (or vision-only) must not answer a System One read, or a
+    client could pass by naming any advertised model.
+    """
+    system_one = {m["id"] for m in PROFILE_MODELS.get(PROFILE, [])
+                  if "system_one" in m.get("capabilities", [])}
+    return system_one | set(ALIASES)
+
+
+def served_system_one_model() -> str:
+    """The id the profile's System One model answers under."""
+    for card in PROFILE_MODELS.get(PROFILE, []):
+        if "system_one" in card.get("capabilities", []):
+            return card["id"]
+    raise AssertionError(f"profile {PROFILE!r} advertises no system_one model")
 
 
 def oai_error(status: int, message: str, code: str) -> bytes:
@@ -232,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
             model = "openjev-latest"
         else:
             # The loaded model answers under its own id, whatever alias was used.
-            model = next(m["id"] for m in PROFILE_MODELS[PROFILE] if "system_one" in m["capabilities"])
+            model = served_system_one_model()
         self._send_json(200, {
             "model": model,
             "answers": {"hotdog": {"type": "noul", "noul": probability}},

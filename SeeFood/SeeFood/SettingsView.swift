@@ -34,17 +34,24 @@ struct SettingsView: View {
                     TextField("System One model", text: $systemOneModel)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                    if !systemOneCandidates.isEmpty {
+                    if systemOneCandidates.contains(where: { $0.id == systemOneModel }) {
                         Picker("Serves /systemone", selection: $systemOneModel) {
                             ForEach(systemOneCandidates, id: \.id) { card in
                                 Text(card.label).tag(card.id)
                             }
                         }
+                    } else if !systemOneCandidates.isEmpty {
+                        // A free-typed id the endpoint does not advertise: show the
+                        // candidates instead of a Picker bound to an unknown tag.
+                        Text("This endpoint does not advertise “\(systemOneModel)”. Candidates: "
+                             + systemOneCandidates.map(\.id).joined(separator: ", "))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                     TextField("Vision model (mesh mode)", text: $visionModel)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                    if !visionCandidates.isEmpty {
+                    if visionCandidates.contains(where: { $0.id == visionModel }) {
                         Picker("Accepts images", selection: $visionModel) {
                             ForEach(visionCandidates, id: \.id) { card in
                                 Text(card.label).tag(card.id)

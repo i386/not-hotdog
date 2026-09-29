@@ -49,10 +49,11 @@ loaded model's GGUF architecture
 only when the loaded runtime can actually execute the endpoint (mesh-llm #2093).
 That is what **Discover models** reads.
 
-A Laya-only node has no caption model: mesh mode will report
+A Laya-only node has no caption model: mesh mode reports that the caption model is
+unavailable and names `POST /systemone` (against mesh-llm today the message reads
 *"Vision caption unavailable: this Laya decision model only serves POST
-/systemone"* rather than a bare 501 — point the vision model at a real vision
-family, or use direct mode against upstream OpenJEV. Both were once one
+/systemone"*) rather than surfacing a bare 501 — point the vision model at a real
+vision family, or use direct mode against upstream OpenJEV. Both were once one
 hand-typed model id; the app no longer assumes that.
 
 ## Quick start
@@ -146,12 +147,18 @@ back to mesh mode".
      message names `POST /systemone`)
   9. auto chain on that node → `imagesUnsupported` from direct, caption refusal from
      the fallback
-- The discovery scenario is **falsified, not just green**: with the stub's
-  `system_one` capability removed, scenario 5 fails
-  (`system-one models [] != [diffusiongemma-26B-A4B-it-Q4_K_M]`), so it is testing
-  the capability claim rather than a hardcoded list.
-- The mesh/laya stubs reject model ids they do not serve (plus mesh-llm's alias
-  list), so a client that ignores discovery fails the run.
+- The discovery scenario is **falsified, not just green**: with both the stub's
+  `system_one` capability *and* its `supported` status removed, scenario 5 fails
+  (`system-one models [] != [diffusiongemma-26B-A4B-it-Q4_K_M]`) — so it tests the
+  capability claim, not a hardcoded list. The two signals are independent, so
+  removing only one of them still passes.
+- The mesh/laya stubs answer `/systemone` only for model ids they advertise **and
+  that carry the `system_one` capability**, plus mesh-llm's alias list
+  (`openjev-latest`, `openjev-0.1`, `jev-latest`, `jev-preview`). A client that
+  names an advertised text-only or vision-only model is rejected. The aliases are
+  honoured on purpose — `skippy-server` accepts them for whatever System One model
+  is loaded — so the app's out-of-the-box `openjev-latest` is served by a Laya node
+  too, and discovery decides which id the app actually sends.
 - `project.pbxproj` and `Info.plist`: `plutil -lint` OK; every Swift source
   `swiftc -parse` clean.
 - **Not compiled:** the SwiftUI layer (`SeeFoodApp`, `ContentView`, `Camera`,

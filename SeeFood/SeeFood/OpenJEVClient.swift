@@ -248,8 +248,10 @@ public final class OpenJEVClient {
             // A decision-only backend (Laya, mesh-llm #2083) answers exactly
             // "this Laya decision model only serves POST /systemone" to every
             // other OpenAI surface. Say which setting is wrong instead of
-            // surfacing a bare 501.
-            if message.contains("only serves POST /systemone") {
+            // surfacing a bare 501. Matched loosely so a wording change in the
+            // server ("Laya decision model", another family name) still lands.
+            let lowered = message.lowercased()
+            if lowered.contains("only serves") && lowered.contains("systemone") {
                 throw ClassifyError.visionUnavailable(message: message)
             }
             throw ClassifyError.http(status: status, message: message)
@@ -272,7 +274,8 @@ public final class OpenJEVClient {
     // MARK: GET /v1/models — which models on this deployment serve System One
 
     /// Every model the endpoint advertises, or [] when it advertises none
-    /// (upstream OpenJEV has no /v1/models; a 404 is not an error here).
+    /// (upstream OpenJEV has no /v1/models: 404, or 405 on a server that only
+    /// allows POST — neither is an error here; 401/403 must still surface).
     public func models() async throws -> [ModelCardDTO] {
         var request = URLRequest(url: try endpointURL(path: "/v1/models"))
         request.httpMethod = "GET"
@@ -280,7 +283,7 @@ public final class OpenJEVClient {
 
         let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if status == 404 { return [] }
+        if status == 404 || status == 405 { return [] }
         guard (200 ..< 300).contains(status) else {
             throw ClassifyError.http(status: status, message: Self.errorMessage(from: data, status: status))
         }
